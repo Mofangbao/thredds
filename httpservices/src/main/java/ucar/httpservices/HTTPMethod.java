@@ -40,17 +40,17 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.apache.http.*;
 import org.apache.http.auth.AuthScope;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.*;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.message.BasicHttpResponse;
-import org.apache.http.params.HttpParams;
 import org.apache.http.util.EntityUtils;
 
+import static org.apache.http.auth.AuthScope.*;
 import static ucar.httpservices.HTTPSession.*;
 
 /**
@@ -154,6 +154,10 @@ import static ucar.httpservices.HTTPSession.*;
  * <li> Closing the method (directly or through stream.close())
  * will close the one-shot session created by the method.
  * </ul>
+ * <p/>
+ * It is important to note that as the move to Apache Httpclient 4.3.x,
+ * the HttpRequestBase objects are generally immutable. This means that
+ * the relevant info must be stored and created on demand.
  */
 
 public class HTTPMethod implements AutoCloseable
@@ -169,6 +173,8 @@ public class HTTPMethod implements AutoCloseable
     protected HTTPSession.Methods methodclass = null;
     protected HTTPMethodStream methodstream = null; // wrapper for strm
     protected boolean closed = false;
+
+    // Created on demand
     protected HttpRequestBase request = null;
     protected HttpResponse response = null;
 
@@ -176,19 +182,19 @@ public class HTTPMethod implements AutoCloseable
     // Constructor(s)
 
     public HTTPMethod(HTTPSession.Methods m)
-        throws HTTPException
+            throws HTTPException
     {
         this(m, null, null);
     }
 
     public HTTPMethod(HTTPSession.Methods m, String url)
-        throws HTTPException
+            throws HTTPException
     {
         this(m, null, url);
     }
 
     public HTTPMethod(HTTPSession.Methods m, HTTPSession session, String url)
-        throws HTTPException
+            throws HTTPException
     {
         if(url == null && session != null)
             url = session.getURL();
@@ -213,14 +219,47 @@ public class HTTPMethod implements AutoCloseable
         this.methodclass = m;
     }
 
+    //////////////////////////////////////////////////
+    // Execution support
+
+    /**
+     * Create a request, add headers, and content,
+     * then send to HTTPSession to do the bulk of the work.
+     */
+    public int execute()
+            throws HTTPException
+    {
+        if(closed)
+            throw new HTTPException("HTTPMethod: attempt to execute closed method");
+        if(this.legalurl == null)
+            throw new HTTPException("HTTPMethod: no url specified");
+        if(!localsession && !sessionCompatible(this.legalurl))
+            throw new HTTPException("HTTPMethod: session incompatible url: " + this.legalurl);
+
+        this.request = createRequest();
+
+        // Add any defined headers
+        if(headers.size() > 0) {
+            for(Header h : headers) {
+                request.addHeader(h);
+            }
+        }
+
+        setcontent(this.request);
+
+        this.response = session.execute(request);
+        int code = response.getStatusLine().getStatusCode();
+        return code;
+    }
+
     protected HttpRequestBase
     createRequest()
-        throws HTTPException
+            throws HTTPException
     {
         HttpRequestBase method = null;
 
         if(this.legalurl == null)
-            throw new HTTPException("Malformed url: " + this.legalurl);
+            throw new HTTPException("No url specified");
 
         switch (this.methodclass) {
         case Put:
@@ -244,7 +283,8 @@ public class HTTPMethod implements AutoCloseable
         return method;
     }
 
-    protected void setcontent(HttpRequestBase request)
+    protected void
+    setcontent(HttpRequestBase request)
     {
         switch (this.methodclass) {
         case Put:
@@ -264,66 +304,12 @@ public class HTTPMethod implements AutoCloseable
         this.content = null; // do not reuse
     }
 
-    public int execute()
-        throws HTTPException
-    {
-        if(closed)
-            throw new HTTPException("HTTPMethod: attempt to execute closed method");
-        if(this.legalurl == null)
-            throw new HTTPException("HTTPMethod: no url specified");
-        if(!localsession && !sessionCompatible(this.legalurl))
-            throw new HTTPException("HTTPMethod: session incompatible url: " + this.legalurl);
-
-        if(this.request != null)
-            this.request.releaseConnection();
-        this.request = createRequest();
-
-        try {
-            // Add any defined headers
-            if(headers.size() > 0) {
-                for(Header h : headers) {
-                    request.addHeader(h);
-                }
-            }
-
-            // Apply settings
-            configure(this.request);
-            setcontent(this.request);
-            AuthScope scope = setAuthentication();
-
-            //todo: Change the retry handler
-            //httpclient.setHttpRequestRetryHandler(myRetryHandler);
-            //request.getParams().setParameter(HttpMethodParams.RETRY_HANDLER, new RetryHandler());
-
-            //todo: get the protocol and port
-            //URL hack = new URL(this.legalurl);
-            //Protocol handler = session.getProtocol(hack.getProtocol(),
-            //    hack.getPort());
-            //HostConfiguration hc = session.sessionClient.getHostConfiguration();
-            //hc = new HostConfiguration(hc);
-            //hc.setHost(hack.getHost(), hack.getPort(), handler);
-
-            this.response = session.execute(request);
-            int code = response.getStatusLine().getStatusCode();
-
-            // On authorization error, clear entries from the credentials cache
-            if(code == HttpStatus.SC_UNAUTHORIZED
-                || code == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
-                HTTPCachingProvider.invalidate(scope);
-            }
-
-            return code;
-
-        } catch (Exception ie) {
-            throw new HTTPException(ie);
-        }
-    }
-
-    protected void
+    //////////////////////////////////////////////////
+    protected RequestConfig
     configure(HttpRequestBase request)
         throws HTTPException
     {
-        // merge global and local settings.
+        // merge global and local settings; local overrides global.
         Settings merge = new Settings();
         synchronized (this) {
             Settings s = session.getGlobalSettings();
@@ -335,22 +321,23 @@ public class HTTPMethod implements AutoCloseable
                 merge.setParameter(key, s.getParameter(key));
             }
         }
+        RequestConfig.Builder rb = RequestConfig.custom();
         for(String key : merge.getNames()) {
             Object value = merge.getParameter(key);
-            HttpParams hmp = request.getParams();
-
+            boolean tf = (value instanceof Boolean?(Boolean) value:false);
             if(key.equals(ALLOW_CIRCULAR_REDIRECTS)) {
-                hmp.setParameter(ALLOW_CIRCULAR_REDIRECTS, (Boolean) value);
+                rb.setCircularRedirectsAllowed(tf);
             } else if(key.equals(HANDLE_REDIRECTS)) {
-                hmp.setParameter(HANDLE_REDIRECTS, (Boolean) value);
+                rb.setRedirectsEnabled(tf);
+                rb.setRelativeRedirectsAllowed(tf);
             } else if(key.equals(HANDLE_AUTHENTICATION)) {
-                hmp.setParameter(HANDLE_AUTHENTICATION, (Boolean) value);
+                rb.setAuthenticationEnabled(tf);
             } else if(key.equals(MAX_REDIRECTS)) {
-                hmp.setParameter(MAX_REDIRECTS, (Integer) value);
+                rb.setMaxRedirects((Integer) value);
             } else if(key.equals(SO_TIMEOUT)) {
-                hmp.setParameter(SO_TIMEOUT, (Integer) value);
+                rb.setSocketTimeout((Integer) value);
             } else if(key.equals(CONN_TIMEOUT)) {
-                hmp.setParameter(CONN_TIMEOUT, (Integer) value);
+                rb.setConnectTimeout((Integer) value);
                 // NOTE: Following modifying request, not builder
             } else if(key.equals(USER_AGENT)) {
                 request.setHeader(HEADER_USERAGENT, value.toString());
@@ -358,13 +345,14 @@ public class HTTPMethod implements AutoCloseable
                 request.setHeader(ACCEPT_ENCODING, value.toString());
             } else if(key.equals(PROXY)) {
                 Proxy proxy = (Proxy) value;
-                if(session.sessionClient != null && proxy != null && proxy.host != null) {
+                if(proxy != null && proxy.host != null) {
                     HttpHost httpproxy = new HttpHost(proxy.host, proxy.port);
-                    session.sessionClient.getParams().setParameter(PROXY, httpproxy);
+                    request.setProxy(httpproxy);
                 }
             } else {
                 throw new HTTPException("Unexpected setting name: " + key);
             }
+            return rb.build();
         }
     }
 
@@ -382,14 +370,12 @@ public class HTTPMethod implements AutoCloseable
         if(methodstream != null) {
             try {
                 methodstream.close();
-            } catch (IOException ioe) {/*failure is ok*/}
-            ;
+            } catch (IOException ioe) {
+                throw new IllegalStateException();
+            }
             methodstream = null;
         }
-        if(this.request != null) {
-            this.request.releaseConnection();
-            this.request = null;
-        }
+        this.response = null;
         if(session != null) {
             session.removeMethod(this);
             if(localsession) {
@@ -409,25 +395,21 @@ public class HTTPMethod implements AutoCloseable
 
     public String getStatusLine()
     {
-        return response == null ? null : response.getStatusLine().toString();
-    }
-
-    public String getRequestLine()
-    {
-        //fix: return (method == null ? null : request.getRequestLine().toString());
-        throw new UnsupportedOperationException("getrequestline not implemented");
+        return this.response == null ? null
+                : this.response.getStatusLine().toString();
     }
 
     public String getPath()
     {
-        return (request == null ? null : request.getURI().toString());
+        return (this.request == null ? null
+                : this.request.getURI().toString());
     }
 
     public boolean canHoldContent()
     {
-        if(request == null)
+        if(this.request == null)
             return false;
-        return !(request instanceof HttpHead);
+        return !(this.request instanceof HttpHead);
     }
 
     public InputStream getResponseBodyAsStream()
@@ -603,11 +585,6 @@ public class HTTPMethod implements AutoCloseable
         return ver;
     }
 
-    public String getSoTimeout()
-    {
-        return request == null ? null : "" + request.getParams().getParameter(SO_TIMEOUT);
-    }
-
     public String getStatusText()
     {
         return getStatusLine();
@@ -625,6 +602,13 @@ public class HTTPMethod implements AutoCloseable
     public void setFollowRedirects(boolean tf)
     {
         //ignore ; always done
+    }
+
+    public void
+    setAllowCompression()
+    {
+        if(this.session != null)
+            this.session.setAllowCompression();
     }
 
     public String getResponseCharSet()
@@ -674,40 +658,6 @@ public class HTTPMethod implements AutoCloseable
         return compatibleURL(sessionurl, other);
     }
 
-    /**
-     * Handle authentication.
-     * We do not know, necessarily,
-     * which scheme(s) will be
-     * encountered, so most testing
-     * occurs in HTTPAuthProvider
-     *
-     * @return an authprovider encapsulting the request
-     */
-
-    synchronized protected AuthScope
-    setAuthentication()
-        throws HTTPException
-    {
-        String surl = session.getURL();
-        // Creat a authscope from the url
-        AuthScope scope;
-        String[] principalp = new String[1];
-        if(surl == null)
-            scope = HTTPAuthScope.ANY;
-        else
-            scope = HTTPAuthScope.urlToScope(HTTPAuthPolicy.BASIC, surl, principalp);
-
-        // Provide a credentials (provider) to enact the process
-        // We use the a caching instance so we can intercept getCredentials
-        // requests to check the cache.
-        HTTPCachingProvider hap = new HTTPCachingProvider(this.session.getAuthStore(),
-            scope, principalp[0]);
-
-        // New in httpclient 4.2; will need to change in 4.3
-        this.session.setAuthentication(hap);
-
-        return scope;
-    }
 
     /**
      * Define URI compatibility.
@@ -733,12 +683,14 @@ public class HTTPMethod implements AutoCloseable
     //////////////////////////////////////////////////
     // debug interface
 
-    public HttpMessage debugRequest()
+    public HttpRequestBase
+    debugRequest()
     {
         return this.request;
     }
 
-    public HttpResponse debugResponse()
+    public HttpResponse
+    debugResponse()
     {
         return this.response;
     }

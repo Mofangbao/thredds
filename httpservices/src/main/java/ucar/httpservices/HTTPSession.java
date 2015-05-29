@@ -36,15 +36,17 @@ package ucar.httpservices;
 import net.jcip.annotations.NotThreadSafe;
 
 import org.apache.http.*;
-import org.apache.http.auth.AuthScope;
-import org.apache.http.auth.Credentials;
-import org.apache.http.client.CredentialsProvider;
-import org.apache.http.client.HttpClient;
+import org.apache.http.auth.*;
+import org.apache.http.client.*;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.entity.DeflateDecompressingEntity;
 import org.apache.http.client.entity.GzipDecompressingEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpRequestBase;
 import org.apache.http.client.params.AllClientPNames;
-import org.apache.http.client.protocol.*;
+import org.apache.http.client.protocol.ClientContext;
+import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.config.*;
 import org.apache.http.conn.scheme.Scheme;
 import org.apache.http.cookie.Cookie;
 import org.apache.http.entity.ContentType;
@@ -54,12 +56,18 @@ import org.apache.http.impl.conn.PoolingClientConnectionManager;
 import org.apache.http.params.SyncBasicHttpParams;
 import org.apache.http.protocol.*;
 import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.*;
+import org.apache.http.impl.conn.*;
+import org.apache.http.protocol.HttpContext;
 
-import javax.net.ssl.SSLException;
+import javax.net.ssl.*;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.nio.charset.UnsupportedCharsetException;
 import java.net.*;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.*;
 
 import static org.apache.http.auth.AuthScope.*;
@@ -70,11 +78,9 @@ import static ucar.httpservices.HTTPAuthScope.*;
  * HTTPSession.  The encapsulation is with respect to a specific url
  * This means that once a session is
  * specified, it is tied permanently to that url.
+ * This class encapsulates an HTTP HttpSession object,
+ * as well as encapsulates an instance of an Apache HttpClient.
  * <p/>
- * <p/>
- * It is important to note that Session objects do NOT correspond
- * with the HttpClient objects of the Apache httpclient library.
- * A Session does, however, encapsulate an instance of an Apache HttpClient.
  * <p/>
  * It is possible to specify a url when invoking, for example,
  * HTTPFactory.Get.  This is because the url argument to the
@@ -104,6 +110,17 @@ import static ucar.httpservices.HTTPAuthScope.*;
  * <p/>
  * Finally, note that if the session was created with no url then all method
  * constructions must specify a url.
+ * <p/>
+ * It is important to note that as the move to Apache Httpclient 4.3.x,
+ * the HttpClient objects are generally immutable. This means that
+ * at least this class (HTTPSession) and HTTPMethod must store
+ * the relevant info and create the HttpClient and HttpMethod objects
+ * dynamically. This also means that when a parameter is changed
+ * (Agent, for example), any existing cached HttpClient must be thrown
+ * away and reconstructed using the change. As a rule, the HttpClient
+ * object will be created at the last minute so that multiple parameter
+ * changes can be effected without have to re-create the HttpClient
+ * for each parameter change.
  */
 
 @NotThreadSafe
@@ -114,7 +131,7 @@ public class HTTPSession implements AutoCloseable
 
     // Define all the legal properties
     // From class AllClientPNames
-    // Use aliases because in httpclient 4.3, AllClientPNames is deprecated
+    // Use aliases because in Httpclient 4.3, AllClientPNames is deprecated
 
     static public final String ALLOW_CIRCULAR_REDIRECTS = AllClientPNames.ALLOW_CIRCULAR_REDIRECTS;
     static public final String HANDLE_REDIRECTS = AllClientPNames.HANDLE_REDIRECTS;
@@ -125,6 +142,10 @@ public class HTTPSession implements AutoCloseable
     static public final String USER_AGENT = AllClientPNames.USER_AGENT;
     static public final String PROXY = AllClientPNames.DEFAULT_PROXY;
     static public final String COMPRESSION = "COMPRESSION";
+    static public final String CONN_REQ_TIMEOUT = "http.connection_request.timeout";
+
+    static public final String RETRIES = "http.retries";
+    static public final String UNAVAILRETRIES = "http.service_unavailable";
 
     // from: http://en.wikipedia.org/wiki/List_of_HTTP_header_fields
     static final public String HEADER_USERAGENT = "User-Agent";
@@ -137,22 +158,57 @@ public class HTTPSession implements AutoCloseable
 
     static final int DFALTTHREADCOUNT = 50;
     static final int DFALTREDIRECTS = 25;
-    static final int DFALTCONNTIMEOUT = 1 * 60 * 1000; // 1 minutes (60000 milliseconds)
-    static final int DFALTSOTIMEOUT = 5 * 60 * 1000; // 5 minutes (300000 milliseconds)
+
     static final String DFALTUSERAGENT = "/NetcdfJava/HttpClient4.3";
+
+    static final int DFALTCONNTIMEOUT = 1 * 60 * 1000; // 1 minutes (60000 milliseconds)
+    static final int DFALTCONNREQTIMEOUT = DFALTCONNTIMEOUT;
+    static final int DFALTSOTIMEOUT = 5 * 60 * 1000; // 5 minutes (300000 milliseconds)
+
+    static final int DFALTRETRIES = 3;
+    static final int DFALTUNAVAILRETRIES = 3;
+    static final int DFALTUNAVAILINTERVAL = 3000; // 3 seconds
 
     //////////////////////////////////////////////////////////////////////////
     // Type Declarations
 
-    // Provide an alias for HttpParams
-    static class Settings extends SyncBasicHttpParams
+    /**
+     * Sub-class List<String,Object> for mnemonic convenience.
+     */
+    static class Settings extends HashMap<String, Object>
     {
+        public Settings()
+        {
+        }
+
+        public Set<String>
+        getNames()
+        {
+            return super.keySet();
+        }
+
+
+        public Object getParameter(String param)
+        {
+            return super.get(param);
+        }
+
+        public void setParameter(String param, Object value)
+        {
+            super.put(param, value);
+        }
+
+        public Object removeParameter(String param)
+        {
+            return super.remove(param);
+        }
     }
 
     static class Proxy
     {
         public String host = null;
         public int port = -1;
+        public String userpwd = null;
     }
 
     static enum Methods
@@ -173,6 +229,7 @@ public class HTTPSession implements AutoCloseable
 
     // Define a Retry Handler that supports specifiable retries
     // and is optionally verbose.
+    /* TBD for 4.3.x
     static public class RetryHandler
         implements org.apache.http.client.HttpRequestRetryHandler
     {
@@ -217,7 +274,8 @@ public class HTTPSession implements AutoCloseable
 
         static public synchronized void setRetries(int retries)
         {
-            RetryHandler.retries = retries;
+            if(retries > 0)
+		RetryHandler.retries = retries;
         }
 
         static public synchronized boolean getVerbose()
@@ -235,7 +293,7 @@ public class HTTPSession implements AutoCloseable
     static class GZIPResponseInterceptor implements HttpResponseInterceptor
     {
         public void process(final HttpResponse response, final HttpContext context)
-            throws HttpException, IOException
+                throws HttpException, IOException
         {
             HttpEntity entity = response.getEntity();
             if(entity != null) {
@@ -257,7 +315,7 @@ public class HTTPSession implements AutoCloseable
     static class DeflateResponseInterceptor implements HttpResponseInterceptor
     {
         public void process(final HttpResponse response, final HttpContext context)
-            throws HttpException, IOException
+                throws HttpException, IOException
         {
             HttpEntity entity = response.getEntity();
             if(entity != null) {
@@ -275,38 +333,58 @@ public class HTTPSession implements AutoCloseable
         }
     }
 
+
     ////////////////////////////////////////////////////////////////////////
     // Static variables
 
     static public org.slf4j.Logger log
-        = org.slf4j.LoggerFactory.getLogger(HTTPSession.class);
+            = org.slf4j.LoggerFactory.getLogger(HTTPSession.class);
 
-    static PoolingClientConnectionManager connmgr;
-
-    // Define a set of settings to hold all the
+    // Use simple map to hold all the
     // settable values; there will be one
     // instance for global and one for local.
 
-    static Settings globalsettings;
-    static List<HttpRequestInterceptor> reqintercepts = new ArrayList<HttpRequestInterceptor>();
-    static List<HttpResponseInterceptor> rspintercepts = new ArrayList<HttpResponseInterceptor>();
+    static protected Settings globalsettings;
+    static protected PoolingHttpClientConnectionManager connmgr;
+
+    static protected KeyStore keystore = null;
+    static protected KeyStore truststore = null;
+    static protected String keypassword = null;
+    static protected String trustpassword = null;
+
+    static protected Boolean globaldebugheaders = null;
 
     static {
-        connmgr = new PoolingClientConnectionManager();
-        connmgr.getSchemeRegistry().register(
-            new Scheme("https", 8443,
-                new CustomSSLProtocolSocketFactory()));
-        connmgr.getSchemeRegistry().register(
-            new Scheme("https", 443,
-                new CustomSSLProtocolSocketFactory()));
+        // re: http://stackoverflow.com/a/19950935/444687
+        // and http://stackoverflow.com/a/20491564/444687
+        SSLContextBuilder builder = SSLContexts.custom();
+        try {
+            builder.loadTrustMaterial(null, new CustomTrustStrategy());
+            SSLContext sslContext = builder.build();
+            X509HostnameVerifier hv509 = new CustomX509HostNameVerifier();
+            SSLConnectionSocketFactory sslsf = new CustomSSLSocketFactory(sslContext, hv509);
+            Registry<ConnectionSocketFactory> r =
+                    RegistryBuilder.<ConnectionSocketFactory>create()
+                            .register("https", sslsf)
+                            .register("http", new PlainConnectionSocketFactory())
+                            .build();
+            connmgr = new PoolingHttpClientConnectionManager(r);
+        } catch (NoSuchAlgorithmException nsae) {
+            System.err.println("Authentication exception: " + nsae);
+        } catch (KeyStoreException kse) {
+            System.err.println("Authentication exception: " + kse);
+        } catch (KeyManagementException kme) {
+            System.err.println("Authentication exception: " + kme);
+        }
+
         globalsettings = new Settings();
         setDefaults(globalsettings);
-        setGlobalUserAgent(DFALTUSERAGENT);
-        setGlobalThreadCount(DFALTTHREADCOUNT);
-        setGlobalConnectionTimeout(DFALTCONNTIMEOUT);
-        setGlobalSoTimeout(DFALTSOTIMEOUT);
         getGlobalProxyD(); // get info from -D if possible
-        setGlobalKeyStore();
+        try {
+            setGlobalKeyStore();
+        } catch (HTTPException he) {
+            System.err.println("Global Key/Trust Store exception:" + he);
+        }
     }
 
     //////////////////////////////////////////////////////////////////////////
@@ -315,15 +393,13 @@ public class HTTPSession implements AutoCloseable
     /// Provide defaults for a settings map
     static void setDefaults(Settings props)
     {
-        if(false) {// turn off for now
-            props.setParameter(HANDLE_REDIRECTS, Boolean.TRUE);
-            props.setParameter(HANDLE_AUTHENTICATION, Boolean.TRUE);
-        }
         props.setParameter(ALLOW_CIRCULAR_REDIRECTS, Boolean.TRUE);
         props.setParameter(MAX_REDIRECTS, (Integer) DFALTREDIRECTS);
         props.setParameter(SO_TIMEOUT, (Integer) DFALTSOTIMEOUT);
         props.setParameter(CONN_TIMEOUT, (Integer) DFALTCONNTIMEOUT);
+        props.setParameter(CONN_REQ_TIMEOUT, (Integer) DFALTCONNREQTIMEOUT);
         props.setParameter(USER_AGENT, DFALTUSERAGENT);
+        setGlobalThreadCount(DFALTTHREADCOUNT);
     }
 
     static synchronized public Settings getGlobalSettings()
@@ -333,16 +409,20 @@ public class HTTPSession implements AutoCloseable
 
     static synchronized public void setGlobalUserAgent(String userAgent)
     {
+        if(userAgent == null || userAgent.length() == 0)
+            throw new IllegalArgumentException();
         globalsettings.setParameter(USER_AGENT, userAgent);
     }
 
     static synchronized public String getGlobalUserAgent()
     {
-        return (String) globalsettings.getParameter(USER_AGENT);
+        return (String) globalsettings.get(USER_AGENT);
     }
 
     static synchronized public void setGlobalThreadCount(int nthreads)
     {
+        if(nthreads <= 0)
+            throw new IllegalArgumentException();
         connmgr.setMaxTotal(nthreads);
         connmgr.setDefaultMaxPerRoute(nthreads);
     }
@@ -360,54 +440,62 @@ public class HTTPSession implements AutoCloseable
 
     static synchronized public List<Cookie> getGlobalCookies()
     {
-        // Must be better way to do this.
-        AbstractHttpClient client = new DefaultHttpClient(connmgr);
-        //coverity[RESOURCE_LEAK]
-        List<Cookie> cookies = client.getCookieStore().getCookies();
-        client = null;
-        return cookies;
+	CookieStore store = (CookieStore)globalsettings.get(COOKIE_STORE);
+        if(store == null)
+	    return new ArrayList<Cookie>();
+	return store.getCookies();
+    }
+
+    static synchronized public void setGlobalCookieStore(CookieStore store)
+    {
+	globalsettings.setParameter(COOKIE_STORE,store);
     }
 
     // Timeouts
 
     static synchronized public void setGlobalConnectionTimeout(int timeout)
     {
-        if(timeout >= 0) globalsettings.setParameter(CONN_TIMEOUT, (Integer) timeout);
+        if(timeout <= 0)
+            throw new IllegalArgumentException();
+        globalsettings.setParameter(CONN_TIMEOUT, (Integer) timeout);
+        globalsettings.setParameter(CONN_REQ_TIMEOUT, (Integer) timeout);
     }
 
     static synchronized public void setGlobalSoTimeout(int timeout)
     {
-        if(timeout >= 0) globalsettings.setParameter(SO_TIMEOUT, (Integer) timeout);
+        if(timeout <= 0)
+            throw new IllegalArgumentException();
+        globalsettings.setParameter(SO_TIMEOUT, (Integer) timeout);
     }
 
     // Proxy
 
     static synchronized public void
-    setGlobalProxy(String host, int port)
+    setGlobalProxy(String host, int port, String userpwd)
     {
+        if(host == null || host.length() == 0)
+            throw new IllegalArgumentException();
+        if(userpwd != null && userpwd.length() == 0)
+            userpwd = null;
+        if(userpwd != null && userpwd.indexOf(':') < 0)
+            throw new IllegalArgumentException();
         Proxy proxy = new Proxy();
         proxy.host = host;
         proxy.port = port;
+        proxy.userpwd = userpwd; // null if not authenticating
         globalsettings.setParameter(PROXY, proxy);
     }
 
-    // Misc.
-
-    static synchronized public void
-    setGlobalCompression()
-    {
-        globalsettings.setParameter(COMPRESSION, "gzip,deflate");
-        HttpResponseInterceptor hrsi = new GZIPResponseInterceptor();
-        rspintercepts.add(hrsi);
-        hrsi = new DeflateResponseInterceptor();
-        rspintercepts.add(hrsi);
-    }
 
     // Authorization
 
     static synchronized protected void
     defineCredentialsProvider(String principal, AuthScope scope, CredentialsProvider provider, HTTPAuthStore store)
     {
+        if(store == null || scope == null)
+            throw new IllegalArgumentException();
+        if(principal == null || principal.length() == 0)
+            principal = HTTPAuthStore.ANY_PRINCIPAL;
         // Add/remove entry to AuthStore
         try {
             if(provider == null) {//remove
@@ -441,6 +529,7 @@ public class HTTPSession implements AutoCloseable
         setGlobalCredentialsProvider(scope, provider);
     }
 
+    /* TBD for 4.3.x
     static public int
     getRetryCount()
     {
@@ -452,6 +541,7 @@ public class HTTPSession implements AutoCloseable
     {
         RetryHandler.setRetries(count);
     }
+    */
 
 
     //////////////////////////////////////////////////
@@ -577,26 +667,6 @@ public class HTTPSession implements AutoCloseable
         return value;
     }
 
-    // Provide for backward compatibility
-    // through the -D properties
-
-    static synchronized void
-    setGlobalKeyStore()
-    {
-        String keypassword = cleanproperty("keystorepassword");
-        String keypath = cleanproperty("keystore");
-        String trustpassword = cleanproperty("truststorepassword");
-        String trustpath = cleanproperty("truststore");
-
-        if(keypath != null || trustpath != null) { // define conditionally
-            HTTPSSLProvider sslprovider = new HTTPSSLProvider(keypath, keypassword,
-                trustpath, trustpassword);
-            setGlobalCredentialsProvider(
-                new AuthScope(ANY_HOST, ANY_PORT, ANY_REALM, HTTPAuthPolicy.SSL),
-                sslprovider);
-        }
-    }
-
     // For backward compatibility, provide
     // programmatic access for setting proxy info
     // Extract proxy info from command line -D parameters
@@ -607,6 +677,7 @@ public class HTTPSession implements AutoCloseable
     {
         String host = System.getProperty("http.proxyHost");
         String port = System.getProperty("http.proxyPort");
+        String userpwd = System.getProperty("http.proxyAuth");// in url form user:pwd
         int portno = -1;
 
         if(host != null) {
@@ -623,36 +694,62 @@ public class HTTPSession implements AutoCloseable
                 }
             }
         }
+        Credentials creds = null;
+        if(userpwd != null) {
+            userpwd = userpwd.trim();
+            if(userpwd.length() > 0 && userpwd.indexOf(':') > 0) {
+                if(host != null)
+                    setGlobalProxy(host, portno, userpwd);
+            }
+        }
+    }
 
-        if(host != null)
-            setGlobalProxy(host, portno);
+    static synchronized public void
+    setGlobalDebugHeaders(boolean print)
+    {
+        globaldebugheaders = new Boolean(print);
+    }
+
+    static synchronized public void
+    resetGlobalDebugHeaders()
+    {
+        globaldebugheaders = null;
     }
 
     //////////////////////////////////////////////////
     // Instance variables
 
-    protected AbstractHttpClient sessionClient = null;
     protected List<ucar.httpservices.HTTPMethod> methodList = new Vector<HTTPMethod>();
-    protected HttpContext execcontext = null; // same instance must be used for all methods
     protected String identifier = "Session";
     protected String legalurl = null;
     protected boolean closed = false;
     protected Settings localsettings = new Settings();
     protected HTTPAuthStore authlocal =  HTTPAuthStore.getDefault();
+
     // We currently only allow the use of global interceptors
     protected List<Object> intercepts = new ArrayList<Object>(); // current set of interceptors;
+
+    // We currently only allow the use of HTTPSession instance interceptors
+    protected List<HttpRequestInterceptor> reqintercepts = new ArrayList<HttpRequestInterceptor>();
+    protected List<HttpResponseInterceptor> rspintercepts = new ArrayList<HttpResponseInterceptor>();
+
+    // cached and recreated as needed
+    protected CloseableHttpClient cachedclient = null;
+    protected AuthScope cachedscope = null;
+    protected URI cachedURI = null;
+    protected HttpClientContext cachedcxt = null;
 
     //////////////////////////////////////////////////
     // Constructor(s)
 
     public HTTPSession()
-        throws HTTPException
+            throws HTTPException
     {
         this(null);
     }
 
     public HTTPSession(String url)
-        throws HTTPException
+            throws HTTPException
     {
         try {
             new URL(url);
@@ -662,7 +759,7 @@ public class HTTPSession implements AutoCloseable
         this.legalurl = url;
         try {
             synchronized (HTTPSession.class) {
-                sessionClient = new DefaultHttpClient(connmgr);
+                cachedclient = new DefaultHttpClient(connmgr);
             }
             if(TESTING) HTTPSession.track(this);
             setInterceptors();
@@ -674,32 +771,41 @@ public class HTTPSession implements AutoCloseable
 
     //////////////////////////////////////////////////
     // Interceptors
+    static protected HttpResponseInterceptor CEKILL = new HTTPUtil.ContentEncodingInterceptor();
 
-    synchronized void
-    setInterceptors()
+    public void
+    setAllowCompression()
     {
-        for(HttpRequestInterceptor hrq : reqintercepts)
-            sessionClient.addRequestInterceptor(hrq);
-        for(HttpResponseInterceptor hrs : rspintercepts)
-            sessionClient.addResponseInterceptor(hrs);
+        localsettings.setParameter(COMPRESSION, "gzip,deflate");
+        HttpResponseInterceptor hrsi = new GZIPResponseInterceptor();
+        rspintercepts.add(hrsi);
+        hrsi = new DeflateResponseInterceptor();
+        rspintercepts.add(hrsi);
     }
 
-    synchronized void
-    clearInterceptors()
+    public void
+    removeCompression()
     {
-        for(HttpRequestInterceptor hrq : reqintercepts)
-            clearInterceptor(hrq);
-        for(HttpResponseInterceptor hrs : rspintercepts)
-            clearInterceptor(hrs);
+        if(localsettings.removeParameter(COMPRESSION) != null) {
+            for(int i = rspintercepts.size() - 1; i >= 0; i--) { // walk backwards
+                HttpResponseInterceptor hrsi = rspintercepts.get(i);
+                if(hrsi instanceof GZIPResponseInterceptor
+                        || hrsi instanceof DeflateResponseInterceptor)
+                    rspintercepts.remove(i);
+            }
+        }
     }
 
-    synchronized void
-    clearInterceptor(Object o)
+    protected void
+    setInterceptors(HttpClientBuilder cb)
     {
-        if(o instanceof HttpResponseInterceptor)
-            sessionClient.removeResponseInterceptorByClass(((HttpResponseInterceptor) o).getClass());
-        if(o instanceof HttpRequestInterceptor)
-            sessionClient.removeRequestInterceptorByClass(((HttpRequestInterceptor) o).getClass());
+        for(HttpRequestInterceptor hrq : reqintercepts) {
+            cb.addInterceptorLast(hrq);
+        }
+        for(HttpResponseInterceptor hrs : rspintercepts) {
+            cb.addInterceptorLast(hrs);
+        // Hack: add Content-Encoding suppressor
+        cb.addInterceptorFirst(CEKILL);
     }
 
     //////////////////////////////////////////////////
@@ -730,44 +836,37 @@ public class HTTPSession implements AutoCloseable
 
     public void setUserAgent(String agent)
     {
-        if(agent != null)
-            localsettings.setParameter(USER_AGENT, agent);
+        if(agent == null || agent.length() == 0)
+            throw new IllegalArgumentException();
+        localsettings.setParameter(USER_AGENT, agent);
     }
 
     public void setSoTimeout(int timeout)
     {
-        if(timeout >= 0) localsettings.setParameter(SO_TIMEOUT, timeout);
+        if(timeout <= 0)
+            throw new IllegalArgumentException();
+        localsettings.setParameter(SO_TIMEOUT, timeout);
     }
 
     public void setConnectionTimeout(int timeout)
     {
-        if(timeout >= 0) localsettings.setParameter(CONN_TIMEOUT, timeout);
+        if(timeout <= 0)
+            throw new IllegalArgumentException();
+        localsettings.setParameter(CONN_TIMEOUT, timeout);
+        localsettings.setParameter(CONN_REQ_TIMEOUT, timeout);
     }
 
     public void setMaxRedirects(int n)
     {
+        if(n < 0) //validate
+            throw new IllegalArgumentException();
         localsettings.setParameter(MAX_REDIRECTS, n);
     }
-
-    // make package specific
-
-    HttpContext
-    getContext()
-    {
-        return this.execcontext;
-    }
-
 
     HttpClient
     getClient()
     {
-        return this.sessionClient;
-    }
-
-    HttpContext
-    getExecutionContext()
-    {
-        return this.execcontext;
+        return this.cachedclient;
     }
 
     //////////////////////////////////////////////////
@@ -788,14 +887,6 @@ public class HTTPSession implements AutoCloseable
         closed = true;
     }
 
-    public List<Cookie> getCookies()
-    {
-        if(sessionClient == null)
-            return null;
-        List<Cookie> cookies = sessionClient.getCookieStore().getCookies();
-        return cookies;
-    }
-
     synchronized void addMethod(HTTPMethod m)
     {
         if(!methodList.contains(m))
@@ -809,11 +900,8 @@ public class HTTPSession implements AutoCloseable
 
     public void clearState()
     {
-        sessionClient.getCredentialsProvider().clear();
-        sessionClient.getCookieStore().clear();
-        execcontext = new BasicHttpContext();
-        localsettings.clear();
-        authlocal.clear();
+        this.localsettings.clear();
+        this.authlocal.clear();
     }
 
     //////////////////////////////////////////////////
@@ -823,7 +911,6 @@ public class HTTPSession implements AutoCloseable
     void
     setProxy(Proxy proxy)
     {
-        if(sessionClient == null) return;
         if(proxy != null && proxy.host != null)
             localsettings.setParameter(PROXY, proxy);
     }
@@ -832,11 +919,12 @@ public class HTTPSession implements AutoCloseable
     // External API
 
     public void
-    setProxy(String host, int port)
+    setProxy(String host, int port, String userpwd /*user:pwd*/)
     {
         Proxy proxy = new Proxy();
         proxy.host = host;
         proxy.port = port;
+        proxy.userpwd = userpwd;
         setProxy(proxy);
     }
 
@@ -875,7 +963,7 @@ public class HTTPSession implements AutoCloseable
     // Also assume this is a compatible url to the Session url
     public void
     setCredentialsProvider(String surl)
-        throws HTTPException
+            throws HTTPException
     {
         // Try to extract user info
         URI uri = HTTPAuthScope.decompose(surl);
@@ -892,22 +980,274 @@ public class HTTPSession implements AutoCloseable
         }
     }
 
-    // This provides support for HTTPMethod.setAuthentication method
-    synchronized protected void
-    setAuthentication(HTTPCachingProvider hap)
+    //////////////////////////////////////////////////
+    // Execution Support
+
+    // Package visible
+
+    /**
+     * Called primarily from HTTPMethod to do the bulk
+     * of the execution. Assumes HTTPMethod
+     * has inserted its headers into request.
+     */
+
+    HttpResponse
+    execute(HttpRequestBase request)
+            throws HTTPException
     {
-        this.sessionClient.setCredentialsProvider(hap);
-        if(false)
-            this.execcontext.setAttribute(ClientContext.CREDS_PROVIDER, hap);
+        this.cachedURI = request.getURI();
+        Settings merged;
+        synchronized (this) {// keep coverity happy
+            merged = merge(globalsettings, localsettings);
+        }
+        RequestConfig.Builder rb = RequestConfig.custom();
+        configureRequest(request, rb, merged);
+        HttpClientBuilder cb = HttpClients.custom();
+        if(this.cachedcxt == null)
+            this.cachedcxt = HttpClientContext.create();
+        configClient(cb, merged);
+        setAuthentication(cb, rb, merged);
+        HttpHost target = httpHostFor(this.cachedURI);
+        this.cachedclient = cb.build();
+        request.setConfig(rb.build());
+        CloseableHttpResponse response;
+        try {
+            response = cachedclient.execute(target, request, this.cachedcxt);
+        } catch (IOException ioe) {
+            throw new HTTPException(ioe);
+        }
+        int code = response.getStatusLine().getStatusCode();
+        // On authorization error, clear entries from the credentials cache
+        if(code == HttpStatus.SC_UNAUTHORIZED
+                || code == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+            HTTPCachingProvider.invalidate(this.cachedscope);
+        }
+        return response;
     }
 
-    // do an actual execution
-    protected HttpResponse
-    execute(HttpRequestBase request)
-        throws IOException
+/*
+    ssl.TrustManagerFactory.algorithm
+    javax.net.ssl.trustStoreType
+    javax.net.ssl.trustStore
+    javax.net.ssl.trustStoreProvider
+    javax.net.ssl.trustStorePassword
+    ssl.KeyManagerFactory.algorithm
+    javax.net.ssl.keyStoreType
+    javax.net.ssl.keyStore
+    javax.net.ssl.keyStoreProvider
+    javax.net.ssl.keyStorePassword
+    https.protocols
+    https.cipherSuites
+    http.proxyHost
+    http.proxyPort
+    http.nonProxyHosts
+    http.keepAlive
+    http.maxConnections
+    http.agent
+*/
+
+    protected void
+    configClient(HttpClientBuilder cb, Settings settings)
+            throws HTTPException
     {
-        HttpResponse response = sessionClient.execute(request, this.execcontext);
-        return response;
+        setInterceptors(cb);
+        // Set retries
+        cb.setRetryHandler(new DefaultHttpRequestRetryHandler(DFALTRETRIES, false));
+        cb.setServiceUnavailableRetryStrategy(new DefaultServiceUnavailableRetryStrategy(DFALTUNAVAILRETRIES, DFALTUNAVAILINTERVAL));
+    }
+
+    protected void
+    configureRequest(HttpRequestBase request, RequestConfig.Builder rb, Settings settings)
+            throws HTTPException
+    {
+        // Always define these
+        rb.setExpectContinueEnabled(true);
+        rb.setAuthenticationEnabled(true);
+
+        // Configure the RequestConfig
+        for(String key : settings.getNames()) {
+            Object value = settings.getParameter(key);
+            boolean tf = (value instanceof Boolean ? (Boolean) value : false);
+            if(key.equals(ALLOW_CIRCULAR_REDIRECTS)) {
+                rb.setCircularRedirectsAllowed(tf);
+            } else if(key.equals(HANDLE_REDIRECTS)) {
+                rb.setRedirectsEnabled(tf);
+                rb.setRelativeRedirectsAllowed(tf);
+            } else if(key.equals(MAX_REDIRECTS)) {
+                rb.setMaxRedirects((Integer) value);
+            } else if(key.equals(SO_TIMEOUT)) {
+                rb.setSocketTimeout((Integer) value);
+            } else if(key.equals(CONN_TIMEOUT)) {
+                rb.setConnectTimeout((Integer) value);
+            } else if(key.equals(CONN_REQ_TIMEOUT)) {
+                rb.setConnectionRequestTimeout((Integer) value);
+            } // else ignore
+        }
+
+        // Configure the request directly
+        for(String key : settings.getNames()) {
+            Object value = settings.getParameter(key);
+            boolean tf = (value instanceof Boolean ? (Boolean) value : false);
+            if(key.equals(USER_AGENT)) {
+                request.setHeader(HEADER_USERAGENT, value.toString());
+            } else if(key.equals(COMPRESSION)) {
+                request.setHeader(ACCEPT_ENCODING, value.toString());
+            } // else ignore
+        }
+    }
+
+    protected Settings
+    merge(Settings globalsettings, Settings localsettings)
+    {
+        // merge global and local settings; local overrides global.
+        Settings merge = new Settings();
+        for(String key : globalsettings.getNames()) {
+            merge.setParameter(key, globalsettings.getParameter(key));
+        }
+        for(String key : localsettings.getNames()) {
+            merge.setParameter(key, localsettings.getParameter(key));
+        }
+        return merge;
+    }
+
+    /**
+     * Handle authentication.
+     * We do not know, necessarily,
+     * which scheme(s) will be
+     * encountered, so most testing
+     * occurs in HTTPAuthProvider
+     *
+     * @return an authprovider encapsulting the request
+     */
+
+    synchronized protected void
+    setAuthentication(HttpClientBuilder cb, RequestConfig.Builder rb, Settings settings)
+            throws HTTPException
+    {
+        // Creat a authscope from the url
+        String[] principalp = new String[1];
+        if(this.cachedURI == null)
+            this.cachedscope = HTTPAuthScope.ANY;
+        else
+            this.cachedscope = HTTPAuthScope.uriToScope(HTTPAuthPolicy.BASIC, this.cachedURI, principalp);
+
+        // Provide a credentials (provider) to enact the process
+        // We use the a caching instance so we can intercept getCredentials
+        // requests to check the cache.
+        // Changes in httpclient 4.3 may make this simpler, but for now, leave alone
+
+        HTTPCachingProvider hap = new HTTPCachingProvider(this.getAuthStore(), this.cachedscope, principalp[0]);
+        cb.setDefaultCredentialsProvider(hap);
+
+        // Handle proxy, including proxy auth.
+        Object value = settings.getParameter(PROXY);
+        if(value != null) {
+            Proxy proxy = (Proxy) value;
+            if(proxy.host != null) {
+                HttpHost httpproxy = new HttpHost(proxy.host, proxy.port);
+                // Not clear which is the correct approach
+                if(false) {
+                    DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(httpproxy);
+                    cb.setRoutePlanner(routePlanner);
+                } else {
+                    rb.setProxy(httpproxy);
+                }
+                // Add any proxy credentials
+                if(proxy.userpwd != null) {
+                    AuthScope scope = new AuthScope(httpproxy);
+                    hap.setCredentials(scope, new UsernamePasswordCredentials(proxy.userpwd));
+                }
+
+            }
+        }
+
+        try {
+            if(truststore != null || keystore != null) {
+                SSLContextBuilder builder = SSLContexts.custom();
+                if(truststore != null) {
+                    builder.loadTrustMaterial(truststore,
+                            new TrustSelfSignedStrategy());
+                }
+                if(keystore != null) {
+                    builder.loadKeyMaterial(keystore, keypassword.toCharArray());
+                }
+                SSLContext sslcxt = builder.build();
+                SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(sslcxt);
+
+                cb.setSSLSocketFactory(sslsf);
+
+            }
+        } catch (KeyStoreException ke) {
+            throw new HTTPException(ke);
+        } catch (NoSuchAlgorithmException nsae) {
+            throw new HTTPException(nsae);
+        } catch (KeyManagementException kme) {
+            throw new HTTPException(kme);
+        } catch (UnrecoverableEntryException uee) {
+            throw new HTTPException(uee);
+        }
+    }
+
+    protected HttpHost
+    httpHostFor(URI uri)
+    {
+        return new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
+    }
+
+    //////////////////////////////////////////////////
+    // Testing support
+
+    // Expose the state for testing purposes
+    public boolean isClosed()
+    {
+        return this.closed;
+    }
+
+    public int getMethodcount()
+    {
+        return methodList.size();
+    }
+
+    protected String getSessionID()
+    {
+	String sid = null;
+	String jsid = null;
+	List<Cookie> cookies = cachedclient.getCookieStore().getCookies();
+	for(Cookie cookie: cookies) {
+	    if(cookie.getName().equalsIgnoreCase("sessionid"))
+		sid = cookie.getValue();
+	    if(cookie.getName().equalsIgnoreCase("jsessionid"))
+		jsid = cookie.getValue();
+	}		    
+	return (sid == null ? jsid : sid);
+    }
+
+    protected void ensureHttpClient()
+    {
+        if(this.cachevalid)
+            return;
+	// We need to rebuild the cached client object
+
+/*
+    ssl.TrustManagerFactory.algorithm
+    javax.net.ssl.trustStoreType
+    javax.net.ssl.trustStore
+    javax.net.ssl.trustStoreProvider
+    javax.net.ssl.trustStorePassword
+    ssl.KeyManagerFactory.algorithm
+    javax.net.ssl.keyStoreType
+    javax.net.ssl.keyStore
+    javax.net.ssl.keyStoreProvider
+    javax.net.ssl.keyStorePassword
+    https.protocols
+    https.cipherSuites
+    http.proxyHost
+    http.proxyPort
+    http.nonProxyHosts
+    http.keepAlive
+    http.maxConnections
+    http.agent
+*/
     }
 
     //////////////////////////////////////////////////
@@ -920,6 +1260,190 @@ public class HTTPSession implements AutoCloseable
     }
 
     synchronized public int getMethodcount()
+    {
+        return methodList.size();
+    }
+
+/*
+    ssl.TrustManagerFactory.algorithm
+    javax.net.ssl.trustStoreType
+    javax.net.ssl.trustStore
+    javax.net.ssl.trustStoreProvider
+    javax.net.ssl.trustStorePassword
+    ssl.KeyManagerFactory.algorithm
+    javax.net.ssl.keyStoreType
+    javax.net.ssl.keyStore
+    javax.net.ssl.keyStoreProvider
+    javax.net.ssl.keyStorePassword
+    https.protocols
+    https.cipherSuites
+    http.proxyHost
+    http.proxyPort
+    http.nonProxyHosts
+    http.keepAlive
+    http.maxConnections
+    http.agent
+*/
+
+    protected void
+    configClient(HttpClientBuilder cb, Settings settings)
+        throws HTTPException
+    {
+        Object value = settings.getParameter(PROXY);
+        if(value != null) {
+            Proxy proxy = (Proxy) value;
+            if(proxy.host != null) {
+                HttpHost httpproxy = new HttpHost(proxy.host, proxy.port);
+                DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(httpproxy);
+                cb.setRoutePlanner(routePlanner);
+            }
+        }
+        setInterceptors(cb);
+    }
+
+    protected void
+    configureRequest(HttpRequestBase request, RequestConfig.Builder rb, Settings settings)
+        throws HTTPException
+    {
+        // Configure the RequestConfig
+        for(String key : settings.getNames()) {
+            Object value = settings.getParameter(key);
+            boolean tf = (value instanceof Boolean ? (Boolean) value : false);
+            if(key.equals(ALLOW_CIRCULAR_REDIRECTS)) {
+                rb.setCircularRedirectsAllowed(tf);
+            } else if(key.equals(HANDLE_REDIRECTS)) {
+                rb.setRedirectsEnabled(tf);
+                rb.setRelativeRedirectsAllowed(tf);
+            } else if(key.equals(HANDLE_AUTHENTICATION)) {
+                rb.setAuthenticationEnabled(tf);
+            } else if(key.equals(MAX_REDIRECTS)) {
+                rb.setMaxRedirects((Integer) value);
+            } else if(key.equals(SO_TIMEOUT)) {
+                rb.setSocketTimeout((Integer) value);
+            } else if(key.equals(CONN_TIMEOUT)) {
+                rb.setConnectTimeout((Integer) value);
+            } // else ignore
+        }
+        // Configure the request directly
+        for(String key : settings.getNames()) {
+            Object value = settings.getParameter(key);
+            boolean tf = (value instanceof Boolean ? (Boolean) value : false);
+            if(key.equals(USER_AGENT)) {
+                request.setHeader(HEADER_USERAGENT, value.toString());
+            } else if(key.equals(COMPRESSION)) {
+                request.setHeader(ACCEPT_ENCODING, value.toString());
+            } // else ignore
+        }
+    }
+
+    protected Settings
+    merge(Settings globalsettings, Settings localsettings)
+    {
+        // merge global and local settings; local overrides global.
+        Settings merge = new Settings();
+        for(String key : globalsettings.getNames()) {
+            merge.setParameter(key, globalsettings.getParameter(key));
+        }
+        for(String key : localsettings.getNames()) {
+            merge.setParameter(key, localsettings.getParameter(key));
+        }
+        return merge;
+    }
+
+    /**
+     * Handle authentication.
+     * We do not know, necessarily,
+     * which scheme(s) will be
+     * encountered, so most testing
+     * occurs in HTTPAuthProvider
+     *
+     * @return an authprovider encapsulting the request
+     */
+
+    synchronized protected void
+    setAuthentication(HttpClientBuilder cb, RequestConfig.Builder rb, Settings settings)
+        throws HTTPException
+    {
+        // Creat a authscope from the url
+        String[] principalp = new String[1];
+        if(this.cachedURI == null)
+            this.cachedscope = HTTPAuthScope.ANY;
+        else
+            this.cachedscope = HTTPAuthScope.uriToScope(HTTPAuthPolicy.BASIC, this.cachedURI, principalp);
+
+        // Provide a credentials (provider) to enact the process
+        // We use the a caching instance so we can intercept getCredentials
+        // requests to check the cache.
+        // Changes in httpclient 4.3 may make this simpler, but for now, leave alone
+
+        HTTPCachingProvider hap = new HTTPCachingProvider(this.getAuthStore(), this.cachedscope, principalp[0]);
+        cb.setDefaultCredentialsProvider(hap);
+
+        // Handle proxy, including proxy auth.
+        Object value = settings.getParameter(PROXY);
+        if(value != null) {
+            Proxy proxy = (Proxy) value;
+            if(proxy.host != null) {
+                HttpHost httpproxy = new HttpHost(proxy.host, proxy.port);
+                // Not clear which is the correct approach
+                if(false) {
+                    DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(httpproxy);
+                    cb.setRoutePlanner(routePlanner);
+                } else {
+                    rb.setProxy(httpproxy);
+                }
+                // Add any proxy credentials
+                if(proxy.userpwd != null) {
+                    AuthScope scope = new AuthScope(httpproxy);
+                    hap.setCredentials(scope, new UsernamePasswordCredentials(proxy.userpwd));
+                }
+
+            }
+        }
+
+        try {
+            if(truststore != null || keystore != null) {
+                SSLContextBuilder builder = SSLContexts.custom();
+                if(truststore != null) {
+                    builder.loadTrustMaterial(truststore,
+                        new TrustSelfSignedStrategy());
+                }
+                if(keystore != null) {
+                    builder.loadKeyMaterial(keystore, keypassword.toCharArray());
+                }
+                SSLContext sslcxt = builder.build();
+                SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(sslcxt);
+
+                cb.setSSLSocketFactory(sslsf);
+
+            }
+        } catch (KeyStoreException ke) {
+            throw new HTTPException(ke);
+        } catch (NoSuchAlgorithmException nsae) {
+            throw new HTTPException(nsae);
+        } catch (KeyManagementException kme) {
+            throw new HTTPException(kme);
+        }  catch (UnrecoverableEntryException uee) {
+            throw new HTTPException(uee);
+        }
+    }
+
+    protected HttpHost
+    httpHostFor(URI uri)
+    {
+        return new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
+    }
+
+    //////////////////////////////////////////////////
+    // Testing support
+
+    // Expose the state for testing purposes
+    public boolean isClosed()
+    {
+        return this.closed;
+    }
+
+    public int getMethodcount()
     {
         return methodList.size();
     }
@@ -946,7 +1470,7 @@ public class HTTPSession implements AutoCloseable
             sessionList.clear();
             // Rebuild the connection manager
             connmgr.shutdown();
-            connmgr = new PoolingClientConnectionManager();
+            connmgr = new PoolingHttpClientConnectionManager();
             setGlobalThreadCount(DFALTTHREADCOUNT);
         }
     }
@@ -966,12 +1490,12 @@ public class HTTPSession implements AutoCloseable
         rq.setPrint(print);
         rs.setPrint(print);
         /* remove any previous */
-        for(int i = reqintercepts.size() - 1;i >= 0;i--) {
+        for(int i = reqintercepts.size() - 1; i >= 0; i--) {
             HttpRequestInterceptor hr = reqintercepts.get(i);
             if(hr instanceof HTTPUtil.InterceptCommon)
                 reqintercepts.remove(i);
         }
-        for(int i = rspintercepts.size() - 1;i >= 0;i--) {
+        for(int i = rspintercepts.size() - 1; i >= 0; i--) {
             HttpResponseInterceptor hr = rspintercepts.get(i);
             if(hr instanceof HTTPUtil.InterceptCommon)
                 rspintercepts.remove(i);
@@ -980,7 +1504,7 @@ public class HTTPSession implements AutoCloseable
         rspintercepts.add(rs);
     }
 
-    public static void
+    public void
     debugReset()
     {
         for(HttpRequestInterceptor hri : reqintercepts) {
@@ -989,7 +1513,7 @@ public class HTTPSession implements AutoCloseable
         }
     }
 
-    public static HTTPUtil.InterceptRequest
+    public HTTPUtil.InterceptRequest
     debugRequestInterceptor()
     {
         for(HttpRequestInterceptor hri : reqintercepts) {
@@ -999,7 +1523,7 @@ public class HTTPSession implements AutoCloseable
         return null;
     }
 
-    public static HTTPUtil.InterceptResponse
+    public HTTPUtil.InterceptResponse
     debugResponseInterceptor()
     {
         for(HttpResponseInterceptor hri : rspintercepts) {
@@ -1009,4 +1533,51 @@ public class HTTPSession implements AutoCloseable
         return null;
     }
 
+    //////////////////////////////////////////////////
+    // KeyStore Management
+
+    // Provide for backward compatibility
+    // through the -D properties
+
+    static synchronized void
+    setGlobalKeyStore()
+            throws HTTPException
+    {
+        String keypassword = cleanproperty("keystorepassword");
+        String keypath = cleanproperty("keystore");
+        String trustpassword = cleanproperty("truststorepassword");
+        String trustpath = cleanproperty("truststore");
+        try {
+            if(keypath != null || trustpath != null) { // define conditionally
+                // Load the stores
+                truststore = KeyStore.getInstance(KeyStore.getDefaultType());
+                FileInputStream instream = new FileInputStream(new File(trustpath));
+                try {
+                    truststore.load(instream, trustpassword.toCharArray());
+                } finally {
+                    instream.close();
+                }
+                keystore = KeyStore.getInstance(KeyStore.getDefaultType());
+                instream = new FileInputStream(new File(keypath));
+                try {
+                    keystore.load(instream, keypassword.toCharArray());
+                } finally {
+                    instream.close();
+                }
+                HTTPSession.keypassword = keypassword;
+                HTTPSession.trustpassword = trustpassword;
+            }
+        } catch (IOException ioe) {
+            throw new HTTPException(ioe);
+        } catch (NoSuchAlgorithmException nsae) {
+            throw new HTTPException(nsae);
+        } catch (CertificateException ce) {
+            throw new HTTPException(ce);
+        } catch (KeyStoreException ke) {
+            throw new HTTPException(ke);
+        }
+
+    }
+
 }
+

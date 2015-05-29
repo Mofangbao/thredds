@@ -141,18 +141,17 @@ abstract public class HTTPAuthScope
     }
 
     /**
-     * Create an AuthScope from a URL; pull out any principal
+     * Create an AuthScope from a URI; pull out any principal
      *
-     * @param surl       to convert
+     * @param uri       to convert
      * @param principalp to store principal from url
      * @returns an AuthScope instance
      */
 
     static public AuthScope
-    urlToScope(String authscheme, String surl, String[] principalp)
+    uriToScope(String authscheme, URI uri, String[] principalp)
         throws HTTPException
     {
-        URI uri = HTTPAuthScope.decompose(surl);
         AuthScope scope = new AuthScope(uri.getHost(),
             uri.getPort(),
             ANY_REALM,

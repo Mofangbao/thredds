@@ -56,6 +56,9 @@ import java.util.List;
  * repeatedly calls the server in checkifdods() with
  * a new HTTPSession, so we get repeated requests to
  * the credentials provider.
+ *
+ * Note for apache httpclient 4.3: not clear if this is still
+ * needed or if BasicCredentialsProvider handles caching.
  */
 
 public class HTTPCachingProvider implements CredentialsProvider
@@ -151,7 +154,7 @@ public class HTTPCachingProvider implements CredentialsProvider
             // search for matching authstore entries
             List<HTTPAuthStore.Entry> matches = this.store.search(this.principal, this.authscope);
             if(matches.size() == 0)
-                throw new InvalidCredentialsException("HTTPCachingProvider: no credentials that match Authorization scope:" + this.authscope);
+                throw new InvalidCredentialsException("HTTPCachingProvider: no match for:" + this.authscope);
 
             // Choose the most restrictive
             HTTPAuthStore.Entry entry = matches.get(0);
@@ -174,17 +177,17 @@ public class HTTPCachingProvider implements CredentialsProvider
 
             return credentials;
         } catch (InvalidCredentialsException ice) {
-            HTTPSession.log.debug(ice.getMessage());
+            HTTPSession.log.error(ice.getMessage());
             return null;
         }
     }
 
-    public void setCredentials(AuthScope scope, Credentials creds)
+    synchronized public void setCredentials(AuthScope scope, Credentials creds)
     {
         cacheCredentials(HTTPAuthStore.ANY_PRINCIPAL, this.authscope, creds);
     }
 
-    public void clear()
+    synchronized public void clear()
     {
     }
 
