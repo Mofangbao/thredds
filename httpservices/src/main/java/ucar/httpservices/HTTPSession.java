@@ -38,6 +38,7 @@ import net.jcip.annotations.NotThreadSafe;
 import org.apache.http.*;
 import org.apache.http.auth.*;
 import org.apache.http.client.*;
+import org.apache.http.client.CookieStore;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.entity.DeflateDecompressingEntity;
 import org.apache.http.client.entity.GzipDecompressingEntity;
@@ -48,6 +49,9 @@ import org.apache.http.client.protocol.ClientContext;
 import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.config.*;
 import org.apache.http.conn.scheme.Scheme;
+import org.apache.http.conn.socket.ConnectionSocketFactory;
+import org.apache.http.conn.socket.PlainConnectionSocketFactory;
+import org.apache.http.conn.ssl.*;
 import org.apache.http.cookie.Cookie;
 import org.apache.http.entity.ContentType;
 import org.apache.http.impl.client.AbstractHttpClient;
@@ -139,6 +143,8 @@ public class HTTPSession implements AutoCloseable
     static public final String MAX_REDIRECTS = AllClientPNames.MAX_REDIRECTS;
     static public final String SO_TIMEOUT = AllClientPNames.SO_TIMEOUT;
     static public final String CONN_TIMEOUT = AllClientPNames.CONNECTION_TIMEOUT;
+    static public final String COOKIE_STORE = org.apache.http.client.protocol.HttpClientContext.COOKIE_STORE;
+
     static public final String USER_AGENT = AllClientPNames.USER_AGENT;
     static public final String PROXY = AllClientPNames.DEFAULT_PROXY;
     static public final String COMPRESSION = "COMPRESSION";
@@ -229,7 +235,7 @@ public class HTTPSession implements AutoCloseable
 
     // Define a Retry Handler that supports specifiable retries
     // and is optionally verbose.
-    /* TBD for 4.3.x
+    /* TBD for 4.3.x  */
     static public class RetryHandler
         implements org.apache.http.client.HttpRequestRetryHandler
     {
@@ -345,14 +351,16 @@ public class HTTPSession implements AutoCloseable
     // instance for global and one for local.
 
     static protected Settings globalsettings;
-    static protected PoolingHttpClientConnectionManager connmgr;
 
+    // As taken from the command line, usually
     static protected KeyStore keystore = null;
     static protected KeyStore truststore = null;
     static protected String keypassword = null;
     static protected String trustpassword = null;
 
     static protected Boolean globaldebugheaders = null;
+
+    static protected PoolingHttpClientConnectionManager connmgr;
 
     static {
         // re: http://stackoverflow.com/a/19950935/444687
@@ -378,7 +386,7 @@ public class HTTPSession implements AutoCloseable
         }
 
         globalsettings = new Settings();
-        setDefaults(globalsettings);
+        setGlobalDefaults();
         getGlobalProxyD(); // get info from -D if possible
         try {
             setGlobalKeyStore();
@@ -390,16 +398,21 @@ public class HTTPSession implements AutoCloseable
     //////////////////////////////////////////////////////////////////////////
     // Static Methods (Mostly global accessors)
 
-    /// Provide defaults for a settings map
-    static void setDefaults(Settings props)
+    // Access defined global property
+    static synchronized Object setGlobalParameter(String name, Object value)
     {
-        props.setParameter(ALLOW_CIRCULAR_REDIRECTS, Boolean.TRUE);
-        props.setParameter(MAX_REDIRECTS, (Integer) DFALTREDIRECTS);
-        props.setParameter(SO_TIMEOUT, (Integer) DFALTSOTIMEOUT);
-        props.setParameter(CONN_TIMEOUT, (Integer) DFALTCONNTIMEOUT);
-        props.setParameter(CONN_REQ_TIMEOUT, (Integer) DFALTCONNREQTIMEOUT);
-        props.setParameter(USER_AGENT, DFALTUSERAGENT);
-        setGlobalThreadCount(DFALTTHREADCOUNT);
+	if(name == null || name.length() == 0)
+            throw new IllegalArgumentException();
+	Object prev = globalsettings.getParameter(name);
+        globalsettings.setParameter(name,value);
+	return prev;
+    }
+
+    static synchronized Object getGlobalParameter(String name)
+    {
+	if(name == null || name.length() == 0)
+            throw new IllegalArgumentException();
+	return globalsettings.getParameter(name);
     }
 
     static synchronized public Settings getGlobalSettings()
@@ -407,16 +420,18 @@ public class HTTPSession implements AutoCloseable
         return globalsettings;
     }
 
-    static synchronized public void setGlobalUserAgent(String userAgent)
+    // Provide defaults for a settings map
+    static void setGlobalDefaults()
     {
-        if(userAgent == null || userAgent.length() == 0)
-            throw new IllegalArgumentException();
-        globalsettings.setParameter(USER_AGENT, userAgent);
-    }
-
-    static synchronized public String getGlobalUserAgent()
-    {
-        return (String) globalsettings.get(USER_AGENT);
+	setGlobalParameter(USER_AGENT,DFALTUSERAGENT);
+        setGlobalParameter(ALLOW_CIRCULAR_REDIRECTS, Boolean.TRUE);
+        setGlobalParameter(MAX_REDIRECTS, (Integer) DFALTREDIRECTS);
+        setGlobalParameter(SO_TIMEOUT, (Integer) DFALTSOTIMEOUT);
+        setGlobalParameter(CONN_TIMEOUT, (Integer) DFALTCONNTIMEOUT);
+        setGlobalParameter(CONN_REQ_TIMEOUT, (Integer) DFALTCONNREQTIMEOUT);
+        setGlobalParameter(USER_AGENT, DFALTUSERAGENT);
+        setGlobalParameter(COOKIE_STORE, new BasicCookieStore());
+        setGlobalThreadCount(DFALTTHREADCOUNT);
     }
 
     static synchronized public void setGlobalThreadCount(int nthreads)
@@ -438,34 +453,43 @@ public class HTTPSession implements AutoCloseable
         return connmgr.getMaxTotal();
     }
 
-    static synchronized public List<Cookie> getGlobalCookies()
+    static public void setGlobalUserAgent(String useragent)
     {
-	CookieStore store = (CookieStore)globalsettings.get(COOKIE_STORE);
-        if(store == null)
-	    return new ArrayList<Cookie>();
+	if(useragent == null || useragen.length() == 0)
+            throw new IllegalArgumentException();
+	setGlobalParameter(USER_AGENT,useragent);
+    }
+
+    static public String getGlobalUserAgent()
+    {return (String) getGlobalParameter(USER_AGENT);}
+
+    static public List<Cookie> getGlobalCookies()
+    {
+	CookieStore store = (CookieStore)getGlobalParameter(COOKIE_STORE);
+        if(store == null) return null;
 	return store.getCookies();
     }
 
-    static synchronized public void setGlobalCookieStore(CookieStore store)
+    static public void setGlobalCookieStore(CookieStore store)
     {
-	globalsettings.setParameter(COOKIE_STORE,store);
+	setGlobalParameter(COOKIE_STORE,store);
     }
 
     // Timeouts
 
-    static synchronized public void setGlobalConnectionTimeout(int timeout)
+    static public void setGlobalConnectionTimeout(int timeout)
     {
         if(timeout <= 0)
             throw new IllegalArgumentException();
-        globalsettings.setParameter(CONN_TIMEOUT, (Integer) timeout);
-        globalsettings.setParameter(CONN_REQ_TIMEOUT, (Integer) timeout);
+        setGlobalParameter(CONN_TIMEOUT, (Integer) timeout);
+        setGlobalParameter(CONN_REQ_TIMEOUT, (Integer) timeout);
     }
 
-    static synchronized public void setGlobalSoTimeout(int timeout)
+    static public void setGlobalSoTimeout(int timeout)
     {
         if(timeout <= 0)
             throw new IllegalArgumentException();
-        globalsettings.setParameter(SO_TIMEOUT, (Integer) timeout);
+        setGlobalParameter(SO_TIMEOUT, (Integer) timeout);
     }
 
     // Proxy
@@ -483,9 +507,8 @@ public class HTTPSession implements AutoCloseable
         proxy.host = host;
         proxy.port = port;
         proxy.userpwd = userpwd; // null if not authenticating
-        globalsettings.setParameter(PROXY, proxy);
+        setGlobalParameter(PROXY, proxy);
     }
-
 
     // Authorization
 
@@ -738,6 +761,8 @@ public class HTTPSession implements AutoCloseable
     protected AuthScope cachedscope = null;
     protected URI cachedURI = null;
     protected HttpClientContext cachedcxt = null;
+
+    protected String sessionid = null;
 
     //////////////////////////////////////////////////
     // Constructor(s)
