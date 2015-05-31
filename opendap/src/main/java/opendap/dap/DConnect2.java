@@ -248,79 +248,70 @@ public class DConnect2
      */
     private void openConnection(String urlString, Command command) throws IOException, DAP2Exception
     {
-        HTTPMethod method = null;
         InputStream is = null;
-
-        HTTPSession _session = null;
-
         try {
-            _session = HTTPFactory.newSession(urlString);
-            method = HTTPFactory.Get(_session);
+            try (HTTPMethod method = HTTPFactory.Get(urlString)) {
 
-            if(acceptCompress)
-                method.setRequestHeader("Accept-Encoding", "deflate,gzip");
+                if(acceptCompress)
+                    method.setRequestHeader("Accept-Encoding", "deflate,gzip");
 
-            // enable sessions
-            if(allowSessions)
-                method.setRequestHeader("X-Accept-Session", "true");
+                // enable sessions
+                if(allowSessions)
+                    method.setRequestHeader("X-Accept-Session", "true");
 
-            int statusCode = method.execute();
+                int statusCode = method.execute();
 
-            // debug
-            // if (debugHeaders) ucar.httpservices.HttpClientManager.showHttpRequestInfo(f, method);
+                // debug
+                // if (debugHeaders) ucar.httpservices.HttpClientManager.showHttpRequestInfo(f, method);
 
-            if(statusCode == HttpStatus.SC_NOT_FOUND) {
-                throw new DAP2Exception(DAP2Exception.NO_SUCH_FILE, method.getStatusText() + ": " + urlString);
+                if(statusCode == HttpStatus.SC_NOT_FOUND) {
+                    throw new DAP2Exception(DAP2Exception.NO_SUCH_FILE, method.getStatusText() + ": " + urlString);
+                }
+
+                if(statusCode == HttpStatus.SC_UNAUTHORIZED) {
+                    throw new InvalidCredentialsException(method.getStatusText());
+                }
+
+                if(statusCode != HttpStatus.SC_OK) {
+                    throw new DAP2Exception("Method failed:" + method.getStatusText() + " on URL= " + urlString);
+                }
+
+                // Get the response body.
+                is = method.getResponseAsStream();
+
+                // check if its an error
+                Header header = method.getResponseHeader("Content-Description");
+                if(header != null && (header.getValue().equals("dods-error")
+                    || header.getValue().equals("dods_error"))) {
+                    // create server exception object
+                    DAP2Exception ds = new DAP2Exception();
+                    // parse the Error object from stream and throw it
+                    ds.parse(is);
+                    throw ds;
+                }
+
+                ver = new ServerVersion(method);
+
+                checkHeaders(method);
+
+                // check for deflator
+                Header h = method.getResponseHeader("content-encoding");
+                String encoding = (h == null) ? null : h.getValue();
+                //if (encoding != null) LogStream.out.println("encoding= " + encoding);
+
+                if(encoding != null && encoding.equals("deflate")) {
+                    is = new BufferedInputStream(new InflaterInputStream(is), 1000);
+
+                } else if(encoding != null && encoding.equals("gzip")) {
+                    is = new BufferedInputStream(new GZIPInputStream(is), 1000);
+                }
+
+                command.process(is);
             }
-
-            if(statusCode == HttpStatus.SC_UNAUTHORIZED) {
-                throw new InvalidCredentialsException(method.getStatusText());
-            }
-
-            if(statusCode != HttpStatus.SC_OK) {
-                throw new DAP2Exception("Method failed:" + method.getStatusText() + " on URL= " + urlString);
-            }
-
-            // Get the response body.
-            is = method.getResponseAsStream();
-
-            // check if its an error
-            Header header = method.getResponseHeader("Content-Description");
-            if(header != null && (header.getValue().equals("dods-error")
-                || header.getValue().equals("dods_error"))) {
-                // create server exception object
-                DAP2Exception ds = new DAP2Exception();
-                // parse the Error object from stream and throw it
-                ds.parse(is);
-                throw ds;
-            }
-
-            ver = new ServerVersion(method);
-
-            checkHeaders(method);
-
-            // check for deflator
-            Header h = method.getResponseHeader("content-encoding");
-            String encoding = (h == null) ? null : h.getValue();
-            //if (encoding != null) LogStream.out.println("encoding= " + encoding);
-
-            if(encoding != null && encoding.equals("deflate")) {
-                is = new BufferedInputStream(new InflaterInputStream(is), 1000);
-
-            } else if(encoding != null && encoding.equals("gzip")) {
-                is = new BufferedInputStream(new GZIPInputStream(is), 1000);
-            }
-
-            command.process(is);
-
         } catch (Exception e) {
             Util.check(e);
             e.printStackTrace();
             throw new DAP2Exception(e);
-
-        } finally {
-            // Release the connection.
-            if(_session != null) _session.close();
         }
     }
 
