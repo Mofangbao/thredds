@@ -261,7 +261,6 @@ public class CdmRemote extends ucar.nc2.NetcdfFile implements AutoCloseable {
 
       // header
       String url = remoteURI + "?req=header";
-<<<<<<< Updated upstream
       try (
         // get the header
         HTTPMethod method = HTTPFactory.Get(httpClient, url)) {
