@@ -52,7 +52,7 @@ import java.util.Formatter;
  * @author caron
  * @since Feb 7, 2009
  */
-public class CdmRemote extends ucar.nc2.NetcdfFile {
+public class CdmRemote extends ucar.nc2.NetcdfFile implements AutoCloseable {
   static public final String PROTOCOL = "cdmremote";
   static public final String SCHEME = PROTOCOL+":";
 
@@ -194,7 +194,6 @@ public class CdmRemote extends ucar.nc2.NetcdfFile {
       assert v.getFullNameEscaped().equals(result.varNameFullEsc);
       result.data.setUnsigned(v.isUnsigned());
       return result.data;
-
     }
   }
 
@@ -262,6 +261,7 @@ public class CdmRemote extends ucar.nc2.NetcdfFile {
 
       // header
       String url = remoteURI + "?req=header";
+<<<<<<< Updated upstream
       try (
         // get the header
         HTTPMethod method = HTTPFactory.Get(httpClient, url)) {
