@@ -38,8 +38,7 @@ import org.apache.http.auth.AuthScope;
 import org.apache.http.util.LangUtils;
 
 import java.io.*;
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.net.*;
 import java.util.Locale;
 
 
@@ -141,24 +140,40 @@ abstract public class HTTPAuthScope
     }
 
     /**
-     * Create an AuthScope from a URI; pull out any principal
+     * Create an AuthScope from a URL
      *
-     * @param uri       to convert
-     * @param principalp to store principal from url
+     * @param url       to convert
      * @returns an AuthScope instance
      */
 
     static public AuthScope
-    uriToScope(String authscheme, URI uri, String[] principalp)
+    urlToScope(String authscheme, URL url)
         throws HTTPException
     {
-        AuthScope scope = new AuthScope(uri.getHost(),
-            uri.getPort(),
-            ANY_REALM,
+        AuthScope scope = new AuthScope(url.getHost(),
+            url.getPort(),
+            HTTPUtil.makerealm(url),
             authscheme);
-        if(principalp != null)
-            principalp[0] = uri.getUserInfo();
         return scope;
+    }
+
+    /**
+     * Create an AuthScope from a URL string
+     *
+     * @param url       to convert
+     * @returns an AuthScope instance
+     */
+
+    static public AuthScope
+    urlToScope(String authscheme, String url)
+        throws HTTPException
+    {
+        try {
+            URL u = new URL(url);
+            return urlToScope(authscheme,u);
+        } catch (MalformedURLException mue) {
+            throw new HTTPException(mue);
+        }
     }
 
     static public boolean

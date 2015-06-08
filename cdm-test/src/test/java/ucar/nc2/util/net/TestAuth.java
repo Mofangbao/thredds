@@ -303,7 +303,7 @@ public class TestAuth extends UnitTestCommon
                 session.clearState();
                 // Test global credentials provider
                 AuthScope scope
-                        = HTTPAuthScope.urlToScope(data.url, HTTPAuthPolicy.BASIC, null);
+                        = HTTPAuthScope.urlToScope(HTTPAuthPolicy.BASIC, data.url);
                 HTTPSession.setGlobalCredentials(scope, cred);
                 session = HTTPFactory.newSession(data.url);
                 method = HTTPFactory.Get(session);
@@ -429,7 +429,7 @@ public class TestAuth extends UnitTestCommon
                 session.clearState();
                 // Test global credentials provider
                 AuthScope scope
-                        = HTTPAuthScope.urlToScope(data.url, HTTPAuthPolicy.BASIC, null);
+                        = HTTPAuthScope.urlToScope(HTTPAuthPolicy.BASIC, data.url);
                 HTTPSession.setGlobalCredentials(scope, cred);
                 session = HTTPFactory.newSession(data.url);
                 method = HTTPFactory.Get(session);
@@ -484,7 +484,7 @@ public class TestAuth extends UnitTestCommon
 
         CredentialsProvider provider = new HTTPSSLProvider(keystore, CLIENTPWD);
         AuthScope scope
-                = HTTPAuthScope.urlToScope(url, HTTPAuthPolicy.SSL, null);
+                = HTTPAuthScope.urlToScope(HTTPAuthPolicy.SSL, url);
         HTTPSession.setGlobalCredentialsProvider(scope, provider);
 
         HTTPSession session = HTTPFactory.newSession(url);
@@ -523,18 +523,15 @@ public class TestAuth extends UnitTestCommon
         // Add some entries to an HTTPAuthStore
         HTTPAuthStore store = new HTTPAuthStore();
 
-        scope = HTTPAuthScope.urlToScope(
-                "http://ceda.ac.uk/dap/neodc/casix/seawifs_plankton/data/monthly/PSC_monthly_1998.nc.dds",
-                HTTPAuthPolicy.BASIC, null);
+        scope = HTTPAuthScope.urlToScope(HTTPAuthPolicy.BASIC,
+            "http://ceda.ac.uk/dap/neodc/casix/seawifs_plankton/data/monthly/PSC_monthly_1998.nc.dds");
         store.insert(HTTPAuthScope.ANY_PRINCIPAL, scope, credp1);
 
-        scope = HTTPAuthScope.urlToScope("http://ceda.ac.uk",
-                HTTPAuthPolicy.SSL, null);
+        scope = HTTPAuthScope.urlToScope(HTTPAuthPolicy.SSL, "http://ceda.ac.uk");
 
         store.insert(HTTPAuthScope.ANY_PRINCIPAL, scope, credp2);
 
-        scope = HTTPAuthScope.urlToScope("http://ceda.ac.uk",
-                HTTPAuthPolicy.BASIC, null);
+        scope = HTTPAuthScope.urlToScope(HTTPAuthPolicy.BASIC, "http://ceda.ac.uk");
         store.insert(HTTPAuthScope.ANY_PRINCIPAL, scope, credp3);
 
         // Remove any old file
@@ -597,7 +594,7 @@ public class TestAuth extends UnitTestCommon
             System.err.println("*** URL: " + url);
             // Test local credentials provider
             HTTPSession session = HTTPFactory.newSession(url);
-            session.setProxy(host, port);
+            session.setProxy(host, port, null);
             session.setCredentialsProvider(provider);
             HTTPMethod method = HTTPFactory.Get(session);
             int status = method.execute();
@@ -609,7 +606,7 @@ public class TestAuth extends UnitTestCommon
             if(pass) {
                 // Test global credentials provider
                 HTTPSession.setGlobalCredentialsProvider(provider);
-                HTTPSession.setGlobalProxy(host, port);
+                HTTPSession.setGlobalProxy(host, port, null);
                 session = HTTPFactory.newSession(url);
                 method = HTTPFactory.Get(session);
                 status = method.execute();

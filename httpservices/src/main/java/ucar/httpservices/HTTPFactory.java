@@ -41,9 +41,6 @@ import java.util.*;
 
 import org.apache.http.*;
 import org.apache.http.client.methods.*;
-import org.apache.http.client.params.AllClientPNames;
-import org.apache.http.params.HttpParams;
-import org.apache.http.protocol.HttpContext;
 
 /**
  * HTTPFactory creates method instance.

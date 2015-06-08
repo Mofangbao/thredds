@@ -221,9 +221,10 @@ public class HTTPAuthStore implements Serializable
         this.isdefault = isdefault;
         this.rows = new ArrayList<Entry>();
         if(isdefault) {
- 	    // For back compatibility, check key/trust store flags
+            // For back compatibility, check key/trust store flags
             // and add appropriate entries
-   	    HTTPSession.setGlobalKeyStore();
+            HTTPSession.setGlobalKeyStoreFromD();
+
         }
     }
 

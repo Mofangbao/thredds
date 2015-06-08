@@ -34,13 +34,17 @@
 package ucar.httpservices;
 
 import org.apache.http.*;
+import org.apache.http.auth.AuthScope;
 import org.apache.http.client.entity.GzipDecompressingEntity;
 import org.apache.http.entity.AbstractHttpEntity;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.protocol.HttpContext;
 
 import java.io.*;
+import java.net.*;
 import java.util.*;
+
+import static org.apache.http.auth.AuthScope.*;
 
 abstract public class HTTPUtil
 {
@@ -56,9 +60,10 @@ abstract public class HTTPUtil
         protected HttpResponse response = null;
         protected boolean printheaders = false;
 
-        public void setPrint(boolean tf)
+        public InterceptCommon setPrint(boolean tf)
         {
             this.printheaders = tf;
+            return this;
         }
 
         public void
@@ -215,5 +220,65 @@ abstract public class HTTPUtil
         }
         return bytes.toByteArray();
     }
+
+    static public String getCanonicalURL(String legalurl)
+    {
+        if(legalurl == null) return null;
+        int index = legalurl.indexOf('?');
+        if(index >= 0) legalurl = legalurl.substring(0, index);
+        // remove any trailing extensuion
+        //index = legalurl.lastIndexOf('.');
+        //if(index >= 0) legalurl = legalurl.substring(0,index);
+        return canonicalpath(legalurl);
+    }
+
+    /**
+     * Convert path to use '/' consistently and
+     * to remove any trailing '/'
+     *
+     * @param path convert this path
+     * @return canonicalized version
+     */
+    static public String canonicalpath(String path)
+    {
+        if(path == null) return null;
+        path = path.replace('\\', '/');
+        if(path.endsWith("/"))
+            path = path.substring(0, path.length() - 1);
+        return path;
+    }
+
+    static public URL
+    removeprincipal(URL u)
+    {
+        // Must be a simpler way
+        try {
+            return new URI(u.getProtocol(), null, u.getHost(), u.getPort(),
+                u.getPath(), u.getQuery(), u.getRef()).toURL();
+        } catch (URISyntaxException | MalformedURLException ex) {
+            HTTPSession.log.error("Malformed url: "+u.toString());
+            return null;
+        }
+    }
+
+    static public String makerealm(URL url)
+    {
+        return makerealm(url.getHost(), url.getPort());
+    }
+
+    static public String makerealm(AuthScope scope)
+    {
+        return makerealm(scope.getHost(), scope.getPort());
+    }
+
+    static public String makerealm(String host, int port)
+    {
+        if(host == null) host = ANY_HOST;
+        if(host == ANY_HOST)
+            return ANY_REALM;
+        String sport = (port <= 0 || port == ANY_PORT) ? "" : String.format("%d", port);
+        return host + ":" + sport;
+    }
+
 
 }
