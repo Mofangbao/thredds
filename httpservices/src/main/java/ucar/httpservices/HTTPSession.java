@@ -187,10 +187,10 @@ public class HTTPSession implements AutoCloseable
             return super.keySet();
         }
 
-        public Set<Map.Entry<String, Object>>
-        getEntries()
+        public Set<String>
+        getKeys()
         {
-            return entrySet();
+            return keySet();
         }
 
         public Object getParameter(String param)
@@ -1054,9 +1054,8 @@ public class HTTPSession implements AutoCloseable
         rb.setAuthenticationEnabled(true);
 
         // Configure the RequestConfig
-        for(Settings.Entry entry : settings.getEntries()) {
-            String key = (String) entry.getKey();
-            Object value = entry.getValue();
+        for(String key: settings.getKeys()) {
+            Object value = settings.getParameter(key);
             boolean tf = (value instanceof Boolean ? (Boolean) value : false);
             if(key.equals(ALLOW_CIRCULAR_REDIRECTS)) {
                 rb.setCircularRedirectsAllowed(tf);
@@ -1075,9 +1074,8 @@ public class HTTPSession implements AutoCloseable
         }
 
         // Configure the request directly
-        for(Settings.Entry entry : settings.getEntries()) {
-            String key = (String) entry.getKey();
-            Object value = entry.getValue();
+        for(String key: settings.getKeys()) {
+            Object value = settings.getParameter(key);
             boolean tf = (value instanceof Boolean ? (Boolean) value : false);
             if(key.equals(USER_AGENT)) {
                 request.setHeader(HEADER_USERAGENT, value.toString());
